@@ -1,0 +1,144 @@
+# ============================================================
+# Large-Scale-Medical (VoCo) .gitignore
+# Python + PyTorch + MONAI research repo.
+# Goal: ignore generated artifacts, caches, large data/weights,
+# logs, and editor/OS noise. Keep only source + docs.
+# ============================================================
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+*.manifest
+*.spec
+
+# Virtual environments / packaging
+venv/
+.venv/
+env/
+.ENV/
+env.bak/
+.python-version
+
+# Type / lint / tooling caches (none configured, but be safe)
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.pytype/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.hypothesis/
+.ipynb_checkpoints/
+
+# ---------- Model weights & checkpoints ----------
+# Pretrained / fine-tuned checkpoints are large and downloaded externally.
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.bin
+checkpoints/
+ckpt/
+weights/
+pretrained/
+pretrained_root/
+runs/
+logs/
+tensorboard/
+tb_logs/
+wandb/
+lightning_logs/
+*.tfevents.*
+events.out.tfevents.*
+
+# ---------- Datasets & caches (huge; never commit) ----------
+# Pre-training / downstream data, nnU-Net preprocessed dirs, persistent caches.
+data/
+dataset/
+datasets/
+cache/
+cache_dir/
+*cache/
+nnUNet_preprocessed/
+nnUNet_results/
+nnUNet_raw/
+nnUNet_trained_models/
+DERIVED_DATASETS/
+
+# Medical-image / array data files
+*.nii
+*.nii.gz
+*.nrrd
+*.mha
+*.mhd
+*.dcm
+*.dicom
+*.hdr
+*.img
+*.gipl
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.zarr
+*.zarr/
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# ---------- Monai / nnU-Net auto-generated ----------
+auto_trainer/
+auto_plan/
+auto_cascade/
+plans.pkl
+crossval_results_folds.json
+
+# ---------- Jupyter ----------
+.ipynb_checkpoints/
+*.ipynb_checkpoints/
+
+# ---------- C / CUDA build artifacts ----------
+*.o
+*.obj
+*.dll
+*.lib
+*.exp
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+
+# ---------- IDE / editor ----------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---------- OS ----------
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ---------- Local config / secrets ----------
+*.local
+.env
+.env.*
+*.key
+*.pem
+opencode.json
