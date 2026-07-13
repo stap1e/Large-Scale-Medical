@@ -1,0 +1,3 @@
+[submodule "external/OCL"]
+	path = external/OCL
+	url = git@github.com:stap1e/OCL.git
