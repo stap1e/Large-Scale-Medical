@@ -1,266 +1,316 @@
 # Copyright 2020 - 2022 MONAI Consortium
 # Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#     http://www.apache.org/licenses/LICENSE-2.0
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+
+"""VoCo pre-training entry point."""
+
+from __future__ import annotations
 
 import argparse
 import os
+import random
+from pathlib import Path
 from time import time
-import logging
+
 import numpy as np
 import torch
 import torch.distributed as dist
 import torch.optim as optim
-from models.voco_head import VoCoHead
-from optimizers.lr_scheduler import WarmupCosineSchedule
 from torch.cuda.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.tensorboard import SummaryWriter
-from utils.data_utils import *
 
-from utils.ops import *
-from utils.utils import AverageMeter, distributed_all_gather
-import torch.multiprocessing
+from models.voco_head import VoCoHead
+from optimizers.lr_scheduler import WarmupCosineSchedule
+from utils.ops import concat_image
+from utils.pretrain_common import (
+    add_bool_argument,
+    add_data_arguments,
+    get_pretraining_loader,
+    resolve_resume_path,
+    restore_checkpoint,
+    run_data_check_only,
+    save_checkpoint,
+    save_final_artifacts,
+    str_to_bool,
+)
+from utils.utils import AverageMeter
 
-torch.multiprocessing.set_sharing_strategy('file_system')
 
-import resource
-rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
-resource.setrlimit(resource.RLIMIT_NOFILE, (8192, rlimit[1]))
+torch.multiprocessing.set_sharing_strategy("file_system")
+try:  # Linux workers benefit from a larger file-descriptor limit.
+    import resource
+
+    soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (min(8192, hard_limit), hard_limit))
+except (ImportError, OSError, ValueError):
+    pass
 
 
-def main():
-    def save_ckp(state, checkpoint_dir):
-        torch.save(state, checkpoint_dir)
+def build_parser() -> argparse.ArgumentParser:
+    roi = 64
+    parser = argparse.ArgumentParser(description="PyTorch VoCo Pre-Training")
+    parser.add_argument("--logdir", default="logs", type=str, help="directory to save logs")
+    parser.add_argument("--num_steps", "--num-steps", default=2_000_000, type=int)
+    parser.add_argument("--eval_num", "--eval-num", default=20_000, type=int, help="checkpoint frequency")
+    parser.add_argument("--log_every", "--log-every", default=1_000, type=int)
+    add_bool_argument(
+        parser,
+        "sync_timing",
+        default=False,
+        help="synchronize CUDA for accurate smoke-test step timing",
+    )
+    parser.add_argument("--warmup_steps", "--warmup-steps", default=5_000, type=int)
+    parser.add_argument("--in_channels", default=1, type=int)
+    parser.add_argument("--feature_size", default=48, type=int)
+    parser.add_argument("--dropout_path_rate", default=0.0, type=float)
+    add_bool_argument(parser, "use_checkpoint", default=True, help="use gradient checkpointing")
+    parser.add_argument("--spatial_dims", default=3, type=int)
+    parser.add_argument("--a_min", default=-175.0, type=float)
+    parser.add_argument("--a_max", default=250.0, type=float)
+    parser.add_argument("--b_min", default=0.0, type=float)
+    parser.add_argument("--b_max", default=1.0, type=float)
+    parser.add_argument("--space_x", default=1.5, type=float)
+    parser.add_argument("--space_y", default=1.5, type=float)
+    parser.add_argument("--space_z", default=1.5, type=float)
+    parser.add_argument("--roi_x", default=roi, type=int)
+    parser.add_argument("--roi_y", default=roi, type=int)
+    parser.add_argument("--roi_z", default=roi, type=int)
+    parser.add_argument("--batch_size", "--batch-size", default=4, type=int)
+    parser.add_argument("--sw_batch_size", "--sw-batch-size", default=2, type=int)
+    parser.add_argument("--lr", default=1e-4, type=float)
+    parser.add_argument("--decay", default=1e-3, type=float)
+    parser.add_argument("--momentum", default=0.9, type=float)
+    add_bool_argument(parser, "lrdecay", default=True, help="enable learning-rate decay")
+    parser.add_argument("--workers", default=16, type=int)
+    parser.add_argument("--max_grad_norm", default=1.0, type=float)
+    parser.add_argument("--opt", choices=("adam", "adamw", "sgd"), default="adamw")
+    parser.add_argument("--lr_schedule", choices=("warmup_cosine", "poly"), default="warmup_cosine")
+    parser.add_argument(
+        "--resume",
+        nargs="?",
+        const="auto",
+        default=None,
+        help="resume path; bare --resume or legacy --resume True uses <logdir>/model_current_epoch.pt",
+    )
+    parser.add_argument("--local-rank", "--local_rank", dest="local_rank", type=int, default=0)
+    add_bool_argument(parser, "grad_clip", default=False, help="clip gradient norm")
+    parser.add_argument("--noamp", nargs="?", const=True, default=False, type=str_to_bool)
+    parser.add_argument("--dist-url", default="env://")
+    add_bool_argument(parser, "cache", default=True, help="use MONAI PersistentDataset cache")
+    add_data_arguments(parser)
+    return parser
 
-    def train(args, global_step, train_loader, val_best, scaler):
+
+def make_optimizer(args, model):
+    if args.opt == "adam":
+        return optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.decay)
+    if args.opt == "adamw":
+        return optim.AdamW(model.parameters(), lr=args.lr, amsgrad=True)
+    return optim.SGD(
+        model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.decay
+    )
+
+
+def make_scheduler(args, optimizer):
+    if not args.lrdecay:
+        return None
+    if args.lr_schedule == "warmup_cosine":
+        return WarmupCosineSchedule(
+            optimizer, warmup_steps=args.warmup_steps, t_total=args.num_steps
+        )
+
+    def polynomial(step: int) -> float:
+        progress = min(float(step) / float(max(1, args.num_steps)), 1.0)
+        return (1.0 - progress) ** 0.9
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=polynomial)
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    args.pretraining_method = "voco"
+    args.amp = not args.noamp
+    if args.num_steps <= 0 or args.eval_num <= 0 or args.log_every <= 0:
+        parser.error("num_steps, eval_num, and log_every must be positive")
+    if args.workers < 0 or args.batch_size <= 0 or args.data_check_samples <= 0:
+        parser.error("workers must be non-negative; batch_size and data_check_samples must be positive")
+
+    if args.data_check_only:
+        run_data_check_only(args)
+        return
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for training; use --data_check_only for the CPU data check")
+
+    args.local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
+    args.distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
+    if args.distributed:
+        torch.cuda.set_device(args.local_rank)
+        dist.init_process_group(backend="nccl", init_method=args.dist_url)
+        args.world_size = dist.get_world_size()
+        args.rank = dist.get_rank()
+        args.device = torch.device("cuda", args.local_rank)
+    else:
+        args.world_size = 1
+        args.rank = 0
+        args.device = torch.device("cuda", 0)
+        torch.cuda.set_device(args.device)
+
+    random.seed(args.seed + args.rank)
+    np.random.seed(args.seed + args.rank)
+    torch.manual_seed(args.seed + args.rank)
+    torch.cuda.manual_seed_all(args.seed + args.rank)
+    torch.backends.cudnn.benchmark = True
+
+    logdir = Path(args.logdir)
+    if args.rank == 0:
+        logdir.mkdir(parents=True, exist_ok=True)
+        mode = f"DDP ({args.world_size} ranks)" if args.distributed else "single GPU"
+        print(f"Training VoCo in {mode}; dataset_mode={args.dataset_mode}")
+
+    model = VoCoHead(args).to(args.device)
+    if args.rank == 0:
+        parameters = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+        print(f"Total trainable parameters: {parameters}")
+
+    optimizer = make_optimizer(args, model)
+    scheduler = make_scheduler(args, optimizer)
+    scaler = GradScaler(enabled=args.amp)
+    global_step = 0
+    resume_path = resolve_resume_path(args.resume, args.logdir)
+    if resume_path is not None:
+        global_step = restore_checkpoint(
+            resume_path, model, optimizer, scheduler, scaler if args.amp else None, args.device
+        )
+
+    if args.distributed:
+        model = DistributedDataParallel(
+            model, device_ids=[args.local_rank], find_unused_parameters=True
+        )
+
+    train_loader = get_pretraining_loader(args)
+    run_loss = AverageMeter()
+    total_step_time = 0.0
+    total_data_time = 0.0
+    measured_steps = 0
+    loader_epoch = 0
+    torch.cuda.reset_peak_memory_stats(args.device)
+
+    while global_step < args.num_steps:
+        if hasattr(train_loader.sampler, "set_epoch"):
+            train_loader.sampler.set_epoch(loader_epoch)
+        step_at_epoch_start = global_step
         model.train()
-        run_loss = AverageMeter()
+        data_wait_started = time()
 
-        for step, batch in enumerate(train_loader):
-            t1 = time()
+        for batch in train_loader:
+            data_elapsed = time() - data_wait_started
+            if global_step >= args.num_steps:
+                break
+            if args.sync_timing:
+                torch.cuda.synchronize(args.device)
+            started = time()
             img, labels, crops = batch
             img, crops = concat_image(img), concat_image(crops)
-            img, crops, labels = img.cuda(), crops.cuda(), labels.cuda()
+            img = img.to(args.device, non_blocking=True)
+            crops = crops.to(args.device, non_blocking=True)
+            labels = labels.to(args.device, non_blocking=True)
 
+            optimizer.zero_grad(set_to_none=True)
             with autocast(enabled=args.amp):
                 loss = model(img, crops, labels)
 
             if args.amp:
+                scale_before = scaler.get_scale()
                 scaler.scale(loss).backward()
+                if args.grad_clip:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
+                update_succeeded = scaler.get_scale() >= scale_before
             else:
                 loss.backward()
                 if args.grad_clip:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer.step()
+                update_succeeded = True
 
-            if args.lrdecay:
+            if not update_succeeded:
+                if args.rank == 0:
+                    print("AMP overflow: skipped optimizer update; global_step and scheduler unchanged")
+                data_wait_started = time()
+                continue
+            if scheduler is not None:
                 scheduler.step()
 
-            optimizer.zero_grad()
-
-            run_loss.update(loss.item(), n=args.batch_size)
-
-            lr = optimizer.param_groups[0]["lr"]
-
-            print_num = 1000
-            if args.distributed:
-                print_cond = (args.rank == 0) and (global_step % print_num == 0)
-            else:
-                print_cond = global_step % print_num == 0
-
-            if print_cond:
-                print("Step:{}/{}, Loss:{:.4f} "
-                      "lr:{:.8f}, Time:{:.4f}".format(global_step, args.num_steps,
-                                                      run_loss.avg,
-                                                      lr, time() - t1))
-
             global_step += 1
-            if args.distributed:
-                val_cond = (args.rank == 0) and (global_step % args.eval_num == 0)
-            else:
-                val_cond = global_step % args.eval_num == 0
+            if args.sync_timing:
+                torch.cuda.synchronize(args.device)
+            elapsed = time() - started
+            total_step_time += elapsed
+            total_data_time += data_elapsed
+            measured_steps += 1
+            run_loss.update(loss.item(), n=labels.shape[0])
 
-            if val_cond:
-                checkpoint = {
-                    "global_step": global_step,
-                    "state_dict": model.state_dict(),
-                }
-                save_ckp(checkpoint, logdir + "/model_current_epoch.pt")
-                save_ckp(checkpoint, logdir + "/model_step" + str(global_step) + ".pt")
+            if args.rank == 0 and (
+                global_step == 1
+                or global_step % args.log_every == 0
+                or global_step == args.num_steps
+            ):
+                lr = optimizer.param_groups[0]["lr"]
+                memory = torch.cuda.max_memory_allocated(args.device) / (1024**2)
+                print(
+                    f"Step:{global_step}/{args.num_steps}, Loss:{run_loss.avg:.4f}, "
+                    f"lr:{lr:.8f}, Data:{data_elapsed:.4f}s, Compute:{elapsed:.4f}s, "
+                    f"MaxMem:{memory:.1f}MiB"
+                )
 
-        return global_step, loss, val_best
+            if args.rank == 0 and global_step % args.eval_num == 0:
+                current = logdir / "model_current_epoch.pt"
+                save_checkpoint(current, model, optimizer, scheduler, scaler if args.amp else None, global_step, args)
+                save_checkpoint(
+                    logdir / f"model_step{global_step}.pt",
+                    model,
+                    optimizer,
+                    scheduler,
+                    scaler if args.amp else None,
+                    global_step,
+                    args,
+                )
+            if global_step >= args.num_steps:
+                break
+            data_wait_started = time()
 
-    roi = 64
-    parser = argparse.ArgumentParser(description="PyTorch Training")
-    parser.add_argument("--logdir", default="logs", type=str, help="directory to save logs")
-    parser.add_argument("--num_steps", default=2000000, type=int, help="number of training iterations")
-    parser.add_argument("--eval_num", default=20000, type=int, help="evaluation frequency")
-    parser.add_argument("--warmup_steps", default=5000, type=int, help="warmup steps")
-    parser.add_argument("--in_channels", default=1, type=int, help="number of input channels")
-    parser.add_argument("--feature_size", default=48, type=int, help="embedding size")
-    parser.add_argument("--dropout_path_rate", default=0.0, type=float, help="drop path rate")
-    parser.add_argument("--use_checkpoint", default=True, help="use gradient checkpointing to save memory")
-    parser.add_argument("--spatial_dims", default=3, type=int, help="spatial dimension of input data")
-    parser.add_argument("--a_min", default=-175.0, type=float, help="a_min in ScaleIntensityRanged")
-    parser.add_argument("--a_max", default=250.0, type=float, help="a_max in ScaleIntensityRanged")
-    parser.add_argument("--b_min", default=0.0, type=float, help="b_min in ScaleIntensityRanged")
-    parser.add_argument("--b_max", default=1.0, type=float, help="b_max in ScaleIntensityRanged")
-    parser.add_argument("--space_x", default=1.5, type=float, help="spacing in x direction")
-    parser.add_argument("--space_y", default=1.5, type=float, help="spacing in y direction")
-    parser.add_argument("--space_z", default=1.5, type=float, help="spacing in z direction")
-    parser.add_argument("--roi_x", default=roi, type=int, help="roi size in x direction")
-    parser.add_argument("--roi_y", default=roi, type=int, help="roi size in y direction")
-    parser.add_argument("--roi_z", default=roi, type=int, help="roi size in z direction")
-    parser.add_argument("--batch_size", default=4, type=int, help="number of batch size")
-    parser.add_argument("--sw_batch_size", default=2, type=int, help="number of sliding window batch size")
-    parser.add_argument("--lr", default=1e-4, type=float, help="learning rate")
-    parser.add_argument("--decay", default=1e-3, type=float, help="decay rate")
-    parser.add_argument("--momentum", default=0.9, type=float, help="momentum")
-    parser.add_argument("--lrdecay", default=True, help="enable learning rate decay")
-    parser.add_argument("--workers", default=16, type=int, help="number of batch size")
-    parser.add_argument("--max_grad_norm", default=1.0, type=float, help="maximum gradient norm")
-    parser.add_argument("--opt", default="adamw", type=str, help="optimization algorithm")
-    parser.add_argument("--lr_schedule", default="warmup_cosine", type=str)
-
-    # './runs/logs_10k/model_current_epoch.pt'
-    parser.add_argument("--resume", default=False, type=str,
-                        help="resume training")
-
-    parser.add_argument("--local-rank", type=int, default=0, help="local rank")
-    parser.add_argument("--grad_clip", default=False, help="gradient clip")
-    parser.add_argument("--noamp", default=False, help="do NOT use amp for training")
-    parser.add_argument("--dist-url", default="env://", help="url used to set up distributed training")
-    parser.add_argument("--cache", default=True, help="use monai cache Dataset")
-
-    args = parser.parse_args()
-    logdir = args.logdir
-
-    args.amp = True
-    torch.backends.cudnn.benchmark = True
-    # torch.autograd.set_detect_anomaly(True)
-    args.distributed = False
-    if "WORLD_SIZE" in os.environ:
-        args.distributed = int(os.environ["WORLD_SIZE"]) > 1
-    args.world_size = 1
-    args.rank = 0
-
-    if args.distributed:
-        args.device = "cuda:%d" % args.local_rank
-        torch.cuda.set_device(args.local_rank)
-        torch.distributed.init_process_group(backend="nccl", init_method=args.dist_url)
-        args.world_size = torch.distributed.get_world_size()
-        args.rank = torch.distributed.get_rank()
-        if args.rank == 0:
-            print(
-                "Training in distributed mode with multiple processes, 1 GPU per process. Process %d, total %d."
-                % (args.rank, args.world_size)
-            )
-    else:
-        torch.cuda.set_device(0)
-        print("Training with a single process on 1 GPUs.")
-    assert args.rank >= 0
+        if global_step == step_at_epoch_start:
+            raise RuntimeError("training loader produced no batches")
+        loader_epoch += 1
 
     if args.rank == 0:
-        os.makedirs(logdir, exist_ok=True)
-    logger = init_log('global', logging.INFO)
-    logger.propagate = 0
-
-    model = VoCoHead(args)
-    model.cuda()
-
-    pytorch_total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    if args.rank == 0 or args.distributed is False:
-        print("Total parameters count", pytorch_total_params)
-
-    if args.opt == "adam":
-        optimizer = optim.Adam(params=model.parameters(), lr=args.lr, weight_decay=args.decay)
-
-    elif args.opt == "adamw":
-        optimizer = optim.AdamW(params=model.parameters(), lr=args.lr, amsgrad=True)
-
-    elif args.opt == "sgd":
-        optimizer = optim.SGD(params=model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.decay)
-
-    global_step = 0
-    if args.resume:
-        if args.rank == 0 or args.distributed is False:
-            print('resume from previous checkpoints')
-        model_pt = os.path.join(args.logdir, 'model_current_epoch.pt')
-        # model_pt = '/home/lwubf/VoCo/runs/logs_swin_B/model_current_epoch.pt'
-
-        model_dict = torch.load(model_pt)
-        state_dict = model_dict["state_dict"]
-        if "module." in list(state_dict.keys())[0]:
-            print("Tag 'module.' found in state dict - fixing!")
-            for key in list(state_dict.keys()):
-                state_dict[key.replace("module.", "")] = state_dict.pop(key)
-        model.load_state_dict(state_dict, strict=True)
-        global_step = model_dict["global_step"]
-
-    if args.lrdecay:
-        if args.lr_schedule == "warmup_cosine":
-            scheduler = WarmupCosineSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=args.num_steps)
-
-        elif args.lr_schedule == "poly":
-
-            def lambdas(epoch):
-                return (1 - float(epoch) / float(args.epochs)) ** 0.9
-
-            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambdas)
+        save_checkpoint(
+            logdir / "model_current_epoch.pt",
+            model,
+            optimizer,
+            scheduler,
+            scaler if args.amp else None,
+            global_step,
+            args,
+        )
+        save_final_artifacts(
+            args.logdir, model, optimizer, scheduler, scaler if args.amp else None, global_step, args
+        )
+        average_time = total_step_time / measured_steps if measured_steps else 0.0
+        average_data_time = total_data_time / measured_steps if measured_steps else 0.0
+        peak_memory = torch.cuda.max_memory_allocated(args.device) / (1024**2)
+        print(
+            f"Training complete at global_step={global_step}; average data={average_data_time:.4f}s; "
+            f"average compute={average_time:.4f}s; "
+            f"max memory={peak_memory:.1f}MiB; checkpoint={logdir / 'model_current_epoch.pt'}"
+        )
 
     if args.distributed:
-        model = DistributedDataParallel(model, device_ids=[args.local_rank], find_unused_parameters=True)
-
-    train_loader = get_loader(args)
-
-    best_val = 1e8
-    if args.amp:
-        scaler = GradScaler()
-    else:
-        scaler = None
-    while global_step < args.num_steps:
-        global_step, loss, best_val = train(args, global_step, train_loader, best_val, scaler)
-    checkpoint = {"epoch": args.epochs, "state_dict": model.state_dict(), "optimizer": optimizer.state_dict()}
-
-    if args.distributed:
-        if dist.get_rank() == 0:
-            torch.save(model.module.state_dict(), logdir + "final_model.pt")
+        dist.barrier()
         dist.destroy_process_group()
-    else:
-        torch.save(model.state_dict(), logdir + "final_model.pt")
-    save_ckp(checkpoint, logdir + "/model_final_epoch.pt")
-
-
-logs = set()
-
-
-def init_log(name, level=logging.INFO):
-    if (name, level) in logs:
-        return
-    logs.add((name, level))
-    logger = logging.getLogger(name)
-    logger.setLevel(level)
-    ch = logging.StreamHandler()
-    ch.setLevel(level)
-    if "SLURM_PROCID" in os.environ:
-        rank = int(os.environ["SLURM_PROCID"])
-        logger.addFilter(lambda record: rank == 0)
-    else:
-        rank = 0
-    format_str = "[%(asctime)s][%(levelname)8s] %(message)s"
-    formatter = logging.Formatter(format_str)
-    ch.setFormatter(formatter)
-    logger.addHandler(ch)
-    return logger
 
 
 if __name__ == "__main__":

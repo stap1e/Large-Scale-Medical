@@ -67,6 +67,146 @@ sh dist_L.sh
 sh dist_H.sh
 ```
 
+### CT-RATE subset pipeline smoke test
+
+This repository also contains an OCL/MiCL entry point (`ocl_train.py`).  The
+CT-RATE subset path below changes only the data source: it reuses the existing
+chest preprocessing, VoCo view transform, backbone, and the selected entry
+point's loss/training logic.  `--dataset_mode original` remains the default and
+keeps the original multi-dataset loader.
+
+The original `jsons/ct_rate.json` is deliberately not used or modified.  Build
+a patient-disjoint manifest from the files that are actually present:
+
+```bash
+cd /path/to/Large-Scale-Medical
+python tools/build_ctrate_subset.py \
+  --data_root /home/bld/data/dataset/CT_RATE/train \
+  --output_json /home/bld/data/dataset/CT_RATE/ct_rate_subset_256.json \
+  --num_patients 256 \
+  --seed 2026 \
+  --selection_mode one_volume_per_patient \
+  --validate_header
+```
+
+The command writes three files and refuses to replace any of them unless
+`--overwrite` is explicitly supplied:
+
+- `ct_rate_subset_256.json`: MONAI Decathlon datalist with relative POSIX paths.
+- `ct_rate_subset_256_patients.txt`: selected patients in manifest order.
+- `ct_rate_subset_256_skipped.json`: empty, zero-byte, or corrupt input reasons.
+
+Run the CPU-safe data/transform/collate check before allocating a model or
+initializing CUDA/DDP:
+
+```bash
+cd /path/to/Large-Scale-Medical/Self-supervised
+python ocl_train.py \
+  --dataset_mode ctrate_subset \
+  --data_root /home/bld/data/dataset/CT_RATE/train \
+  --datalist_json /home/bld/data/dataset/CT_RATE/ct_rate_subset_256.json \
+  --cache_dir /home/bld/data/cache/ctrate_subset_256 \
+  --batch_size 1 --workers 0 --no-cache \
+  --data_check_only
+```
+
+The reused chest transform is `LoadImaged` -> channel first -> RAS -> spacing
+`(1.25, 1.25, 5.0)` -> HU `[-1000, 500]` mapped to `[0, 1]` -> foreground crop
+-> ROI pad -> fixed pad and random crop to `(192, 192, 64)` -> the existing
+`VoCoAugmentation`.  The extra ROI pad and random (not center) fixed-size crop
+are existing repository behavior.  With the defaults, the collated training
+contract is:
+
+```text
+random crops: [2B, 1, 64, 64, 64]
+base crops:   [9B, 1, 64, 64, 64]
+labels:       [B, 2, 9]
+```
+
+OCL consumes the random-crop branch and creates its two masked views in the
+existing `OCLHead3D`; VoCo consumes all three branches.  The smoke script uses
+OCL by default because it exists in this working tree.  Set
+`PRETRAIN_METHOD=voco` to exercise the original VoCo loss instead.
+
+#### Stage A: 10-step path/shape/forward/backward smoke
+
+```bash
+cd /path/to/Large-Scale-Medical
+GPU_ID=0 NUM_STEPS=10 BATCH_SIZE=1 WORKERS=0 NUM_PATIENTS=256 \
+FEATURE_SIZE=48 CACHE=0 LOGDIR="$PWD/Self-supervised/runs/ctrate_stage_a" \
+bash scripts/train_ctrate_subset_smoke.sh
+```
+
+The script first runs `data_check_only`, then runs at most 10 GPU steps.  If
+CUDA is unavailable it exits after the CPU data check.
+
+#### Stage B: 500-step cache/checkpoint smoke
+
+```bash
+cd /path/to/Large-Scale-Medical
+GPU_ID=0 NUM_STEPS=500 BATCH_SIZE=2 WORKERS=4 NUM_PATIENTS=256 \
+CACHE=1 SAVE_EVERY=100 LOG_EVERY=10 \
+LOGDIR="$PWD/Self-supervised/runs/ctrate_stage_b" \
+bash scripts/train_ctrate_subset_smoke.sh
+```
+
+#### Stage C: 5000-step stability and resume run
+
+Start the run (a full 5000-step run is intentionally not part of the smoke
+test), then rerun the same command with `RESUME=1` after an interruption:
+
+```bash
+cd /path/to/Large-Scale-Medical
+GPU_ID=0 NUM_STEPS=5000 BATCH_SIZE=2 WORKERS=4 NUM_PATIENTS=256 \
+CACHE=1 SAVE_EVERY=100 LOG_EVERY=20 \
+LOGDIR="$PWD/Self-supervised/runs/ctrate_stage_c" \
+bash scripts/train_ctrate_subset_smoke.sh
+
+GPU_ID=0 NUM_STEPS=5000 BATCH_SIZE=2 WORKERS=4 NUM_PATIENTS=256 \
+CACHE=1 SAVE_EVERY=100 LOG_EVERY=20 RESUME=1 RUN_DATA_CHECK=0 \
+LOGDIR="$PWD/Self-supervised/runs/ctrate_stage_c" \
+bash scripts/train_ctrate_subset_smoke.sh
+```
+
+`NUM_STEPS` is the target `global_step`, not an additional-step count.  A fast
+checkpoint/resume engineering check can therefore use targets 2 and 4:
+
+```bash
+cd /path/to/Large-Scale-Medical
+NUM_STEPS=2 RUN_DATA_CHECK=0 LOGDIR="$PWD/Self-supervised/runs/ctrate_resume_test" \
+bash scripts/train_ctrate_subset_smoke.sh
+NUM_STEPS=4 RESUME=1 RUN_DATA_CHECK=0 LOGDIR="$PWD/Self-supervised/runs/ctrate_resume_test" \
+bash scripts/train_ctrate_subset_smoke.sh
+```
+
+`model_current_epoch.pt` and `model_final_epoch.pt` contain `global_step`, full
+head weights, optimizer, scheduler, and AMP scaler state.  `final_model.pt`
+keeps the legacy full-head state dict.  `encoder_final.pt` contains plain
+`backbone.state_dict()` keys (`swinViT.*`, `encoder*`) inside its `state_dict`
+field for downstream SwinUNETR loading.
+
+For example, a two-GPU OCL launch is:
+
+```bash
+cd /path/to/Large-Scale-Medical/Self-supervised
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 --master_port=28814 \
+  ocl_train.py \
+  --dataset_mode ctrate_subset \
+  --data_root /home/bld/data/dataset/CT_RATE/train \
+  --datalist_json /home/bld/data/dataset/CT_RATE/ct_rate_subset_256.json \
+  --cache_dir /home/bld/data/cache/ctrate_subset_256 \
+  --batch_size 2 --workers 4 --cache \
+  --num_steps 500 --eval_num 100 \
+  --feature_size 48 --logdir runs/ctrate_ddp
+```
+
+The subset loader uses `DistributedSampler`; OCL additionally drops incomplete
+per-rank batches.  Each manifest contains one volume per patient, so `_1` and
+`_2` reconstructions of a scan cannot become independent patient negatives.
+For a future full training run, one could instead select one reconstruction per
+scan or explicitly model `_1`/`_2` as positives; that is outside this subset
+pipeline task.
+
 
 ## Acknowledgement <a name="Acknowledgment"></a>
 
