@@ -25,7 +25,7 @@ from pathlib import Path
 from time import time
 
 import torch
-from monai.data.utils import hash_key
+from monai.data.utils import pickle_hashing
 
 from utils.data_utils_ctrate_subset import _read_manifest, get_dataset
 from utils.pretrain_common import add_data_arguments
@@ -79,13 +79,13 @@ def _worker_init(args, datalist) -> None:
     _TOTAL = len(_DATASET)
 
 
-def _hash_file(index: int) -> Path:
-    item = _DATASET.data[index]
-    return _DATASET.cache_dir / f"{hash_key(item)}.pt"
+def _hash_file(dataset, index: int) -> Path:
+    item = dataset.data[index]
+    return dataset.cache_dir / f"{pickle_hashing(item, dataset.transform)}.pt"
 
 
 def _build_one(index: int) -> bool:
-    if _hash_file(index).is_file():
+    if _hash_file(_DATASET, index).is_file():
         return False
     _DATASET[index]
     return True
@@ -103,7 +103,19 @@ def main() -> None:
 
     dataset = get_dataset(args, datalist)
     total = len(dataset)
-    cached = sum(1 for i in range(total) if (dataset.cache_dir / f"{hash_key(dataset.data[i])}.pt").is_file())
+    cache_dir = Path(dataset.cache_dir)
+    existing = {p.name for p in cache_dir.glob("*.pt")} if cache_dir.is_dir() else set()
+
+    # Verify the hashing scheme reproduces MONAI's cache file names before
+    # trusting the cached/missing split below.
+    if existing:
+        if _hash_file(dataset, 0).name not in existing:
+            raise RuntimeError(
+                "computed cache hash does not match existing cache files; "
+                "MONAI's PersistentDataset hashing scheme differs from pickle_hashing(item, transform)"
+            )
+
+    cached = sum(1 for i in range(total) if _hash_file(dataset, i).name in existing)
     print(f"already cached: {cached}/{total}; building {total - cached}")
     if cached == total:
         print(f"Cache already complete at {args.cache_dir}")
