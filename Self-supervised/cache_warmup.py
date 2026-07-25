@@ -81,7 +81,7 @@ def _worker_init(args, datalist) -> None:
 
 def _hash_file(dataset, index: int) -> Path:
     item = dataset.data[index]
-    return dataset.cache_dir / f"{pickle_hashing(item, dataset.transform)}.pt"
+    return dataset.cache_dir / f"{pickle_hashing(item)}.pt"
 
 
 def _build_one(index: int) -> bool:
