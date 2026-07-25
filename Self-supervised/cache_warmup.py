@@ -21,10 +21,41 @@ from __future__ import annotations
 
 import argparse
 from multiprocessing import Pool
+from pathlib import Path
 from time import time
+
+import torch
+from monai.utils import HashKeys
 
 from utils.data_utils_ctrate_subset import _read_manifest, get_dataset
 from utils.pretrain_common import add_data_arguments
+
+
+def _patch_torch_load_weights_only() -> None:
+    # MONAI 1.3.0 PersistentDataset loads its cache via torch.load without
+    # passing weights_only.  torch >= 2.6 defaults weights_only=True, which
+    # cannot unpickle MONAI's cached MetaTensor/numpy objects.  The cache is
+    # produced locally and trusted, so default to weights_only=False here.
+    try:
+        import inspect
+
+        if "weights_only" not in inspect.signature(torch.load).parameters:
+            return
+        if getattr(torch.load, "_voc_weights_only_patched", False):
+            return
+        _original = torch.load
+
+        def _load(*args, **kwargs):
+            kwargs.setdefault("weights_only", False)
+            return _original(*args, **kwargs)
+
+        _load._voc_weights_only_patched = True  # type: ignore[attr-defined]
+        torch.load = _load
+    except Exception:
+        pass
+
+
+_patch_torch_load_weights_only()
 
 _DATASET = None
 _TOTAL = 0
@@ -43,12 +74,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _worker_init(args, datalist) -> None:
     global _DATASET, _TOTAL
+    _patch_torch_load_weights_only()
     _DATASET = get_dataset(args, datalist)
     _TOTAL = len(_DATASET)
 
 
+def _hash_file(index: int) -> Path:
+    item = _DATASET.data[index]
+    return _DATASET.cache_dir / f"{hash_key(item)}.pt"
+
+
 def _build_one(index: int) -> bool:
-    if _DATASET._cachecheck_hash_file(index).is_file():
+    if _hash_file(index).is_file():
         return False
     _DATASET[index]
     return True
@@ -66,7 +103,7 @@ def main() -> None:
 
     dataset = get_dataset(args, datalist)
     total = len(dataset)
-    cached = sum(1 for i in range(total) if dataset._cachecheck_hash_file(i).is_file())
+    cached = sum(1 for i in range(total) if (dataset.cache_dir / f"{hash_key(dataset.data[i])}.pt").is_file())
     print(f"already cached: {cached}/{total}; building {total - cached}")
     if cached == total:
         print(f"Cache already complete at {args.cache_dir}")
