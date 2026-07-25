@@ -25,7 +25,7 @@ from pathlib import Path
 from time import time
 
 import torch
-from monai.utils import HashKeys
+from monai.data.utils import hash_key
 
 from utils.data_utils_ctrate_subset import _read_manifest, get_dataset
 from utils.pretrain_common import add_data_arguments
