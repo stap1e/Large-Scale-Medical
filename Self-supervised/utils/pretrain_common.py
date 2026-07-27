@@ -11,6 +11,33 @@ from typing import Any
 import torch
 
 
+def _patch_torch_load_weights_only() -> None:
+    # MONAI 1.3.0 PersistentDataset loads its cache via torch.load without
+    # passing weights_only.  torch >= 2.6 defaults weights_only=True, which
+    # cannot unpickle MONAI's cached MetaTensor/numpy objects.  The cache is
+    # produced locally and trusted, so default to weights_only=False here.
+    try:
+        import inspect
+
+        if "weights_only" not in inspect.signature(torch.load).parameters:
+            return
+        if getattr(torch.load, "_voc_weights_only_patched", False):
+            return
+        _original = torch.load
+
+        def _load(*args, **kwargs):
+            kwargs.setdefault("weights_only", False)
+            return _original(*args, **kwargs)
+
+        _load._voc_weights_only_patched = True  # type: ignore[attr-defined]
+        torch.load = _load
+    except Exception:
+        pass
+
+
+_patch_torch_load_weights_only()
+
+
 def str_to_bool(value: Any) -> bool:
     """Parse both modern flags and legacy ``--flag True/False`` syntax."""
 
