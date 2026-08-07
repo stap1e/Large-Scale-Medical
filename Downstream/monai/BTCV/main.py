@@ -19,6 +19,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.parallel
 import torch.utils.data.distributed
+
+torch.load = partial(torch.load, weights_only=False)
 from optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
 from trainer import run_training
 from utils.data_utils import get_loader
