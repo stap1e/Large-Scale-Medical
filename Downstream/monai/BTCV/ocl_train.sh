@@ -10,7 +10,7 @@ use_persistent_dataset=True
 
 mkdir -p $logdir
 
-torchrun --master_port=21503 main.py \
+python main.py \
     --name $name \
     --pretrained_root $pretrained_root \
     --feature_size $feature_size \
