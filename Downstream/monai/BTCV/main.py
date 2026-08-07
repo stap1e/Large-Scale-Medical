@@ -103,7 +103,6 @@ parser.add_argument("--resume_ckpt", action="store_true", help="resume training 
 parser.add_argument("--smooth_dr", default=1e-6, type=float, help="constant added to dice denominator to avoid nan")
 parser.add_argument("--smooth_nr", default=0.0, type=float, help="constant added to dice numerator to avoid zero")
 parser.add_argument("--use_checkpoint", default=True, help="use gradient checkpointing to save memory")
-parser.add_argument("--checkpoint", default=None, help="start training from saved checkpoint")
 parser.add_argument("--spatial_dims", default=3, type=int, help="spatial dimension of input data")
 parser.add_argument("--squared_dice", action="store_true", help="use squared Dice")
 
