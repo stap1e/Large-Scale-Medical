@@ -35,7 +35,7 @@ from monai.networks.nets.swin_unetr import SwinTransformer as SwinViT
 from monai.utils import ensure_tuple_rep
 from models import get_model
 
-os.environ['CUDA_VISIBLE_DEVICES'] = "3"
+os.environ['CUDA_VISIBLE_DEVICES'] = "0"
 os.environ['MASTER_ADDR'] = 'localhost'
 os.environ['MASTER_PORT'] = '28890'
 
