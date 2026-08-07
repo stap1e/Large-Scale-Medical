@@ -23,6 +23,12 @@ LOG_EVERY="${LOG_EVERY:-1}"
 WARMUP_STEPS="${WARMUP_STEPS:-5000}"
 SYNC_TIMING="${SYNC_TIMING:-1}"
 
+if (( NUM_STEPS > 50 )); then
+    echo "WARNING: train_ctrate_subset_smoke.sh is not a performance launcher." >&2
+    echo "Its defaults (workers=0, cache=off, log_every=1, sync_timing=1) create GPU gaps." >&2
+    echo "Use scripts/train_ctrate_subset_ocl.sh for sustained training/utilization tests." >&2
+fi
+
 # Resolve user-provided relative paths before changing into Self-supervised.
 DATA_ROOT="$(realpath -m -- "${DATA_ROOT}")"
 DATALIST_JSON="$(realpath -m -- "${DATALIST_JSON}")"

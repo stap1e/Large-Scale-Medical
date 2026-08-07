@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import warnings
 from pathlib import Path
 from typing import Any
@@ -116,6 +117,86 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> None:
         help="number of raw NIfTI headers printed by data_check_only",
     )
     parser.add_argument("--seed", type=int, default=2026, help="data-check and sampler seed")
+    parser.add_argument(
+        "--prefetch_factor",
+        "--prefetch-factor",
+        type=int,
+        default=2,
+        help="batches prefetched by each DataLoader worker (ignored when workers=0)",
+    )
+    add_bool_argument(
+        parser,
+        "persistent_workers",
+        default=False,
+        help="keep DataLoader workers alive between iterator/epoch boundaries",
+    )
+    add_bool_argument(
+        parser,
+        "pin_memory",
+        default=True,
+        help="pin collated CPU tensors before host-to-device copies",
+    )
+    parser.add_argument(
+        "--multiprocessing_context",
+        "--multiprocessing-context",
+        choices=("fork", "spawn", "forkserver"),
+        default=None,
+        help="explicit DataLoader multiprocessing context; default uses PyTorch/platform policy",
+    )
+    add_bool_argument(
+        parser,
+        "continuous_dataloader",
+        default=True,
+        help="keep the CT-RATE iterator and prefetch queue alive across logical epochs",
+    )
+    add_bool_argument(
+        parser,
+        "ocl_drop_last",
+        default=True,
+        help="drop incomplete per-rank OCL batches (disable only for old-loader A/B)",
+    )
+    add_bool_argument(
+        parser,
+        "skip_unused_ocl_crops",
+        default=True,
+        help="do not generate the nine VoCo base crops that OCL never consumes",
+    )
+    parser.add_argument(
+        "--disable_training_logging",
+        "--disable-training-logging",
+        action="store_true",
+        help="diagnostic ablation: suppress normal per-step/interval training logging",
+    )
+    parser.add_argument(
+        "--disable_checkpoint",
+        "--disable-checkpoint",
+        action="store_true",
+        help="diagnostic ablation: suppress periodic and final checkpoints",
+    )
+    parser.add_argument(
+        "--disable_validation",
+        "--disable-validation",
+        action="store_true",
+        help="diagnostic ablation: suppress validation (OCL currently has no validation hook)",
+    )
+    parser.add_argument(
+        "--disable_cache_write",
+        "--disable-cache-write",
+        action="store_true",
+        help="diagnostic ablation: read existing persistent cache entries but do not create misses",
+    )
+    parser.add_argument(
+        "--disable_encoder_export",
+        "--disable-encoder-export",
+        action="store_true",
+        help="diagnostic ablation: omit the final standalone encoder export",
+    )
+    parser.add_argument(
+        "--disable_data_integrity_check",
+        "--disable-data-integrity-check",
+        action="store_true",
+        help="diagnostic ablation: skip the one-time all-files-exist manifest scan",
+    )
 
 
 def get_pretraining_loader(args):
@@ -156,29 +237,103 @@ def resolve_resume_path(value: Any, logdir: str) -> Path | None:
     return Path(normalized).expanduser()
 
 
-def checkpoint_payload(model, optimizer, scheduler, scaler, global_step: int, args) -> dict[str, Any]:
+def checkpoint_payload(
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    global_step: int,
+    args,
+    *,
+    include_training_state: bool = True,
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "format_version": 2,
         "global_step": int(global_step),
         "state_dict": unwrap_model(model).state_dict(),
-        "optimizer": optimizer.state_dict(),
         "pretraining_method": args.pretraining_method,
         "feature_size": args.feature_size,
         "num_steps": args.num_steps,
+        "training_state_included": bool(include_training_state),
     }
-    if scheduler is not None:
-        payload["scheduler"] = scheduler.state_dict()
-    if scaler is not None:
-        payload["scaler"] = scaler.state_dict()
+    if include_training_state:
+        payload["optimizer"] = optimizer.state_dict()
+        if scheduler is not None:
+            payload["scheduler"] = scheduler.state_dict()
+        if scaler is not None:
+            payload["scaler"] = scaler.state_dict()
     return payload
 
 
-def save_checkpoint(path: str | Path, model, optimizer, scheduler, scaler, global_step: int, args) -> None:
+def save_checkpoint(
+    path: str | Path,
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    global_step: int,
+    args,
+    *,
+    include_training_state: bool = True,
+) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(destination.name + ".tmp")
-    torch.save(checkpoint_payload(model, optimizer, scheduler, scaler, global_step, args), temporary)
+    torch.save(
+        checkpoint_payload(
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            global_step,
+            args,
+            include_training_state=include_training_state,
+        ),
+        temporary,
+    )
     os.replace(temporary, destination)
+
+
+def save_checkpoint_pair(
+    current_path: str | Path,
+    archival_path: str | Path,
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    global_step: int,
+    args,
+    *,
+    include_training_state: bool = True,
+) -> None:
+    """Serialize once, then atomically point ``current`` at the same snapshot.
+
+    The old loop serialized identical model/AdamW state twice at every
+    checkpoint.  On a single filesystem a hard link is O(1); the copy fallback
+    still avoids a second GPU-to-host serialization pass.
+    """
+
+    archival = Path(archival_path)
+    current = Path(current_path)
+    save_checkpoint(
+        archival,
+        model,
+        optimizer,
+        scheduler,
+        scaler,
+        global_step,
+        args,
+        include_training_state=include_training_state,
+    )
+    current.parent.mkdir(parents=True, exist_ok=True)
+    temporary = current.with_name(current.name + ".tmp-link")
+    try:
+        if temporary.exists():
+            temporary.unlink()
+        os.link(archival, temporary)
+    except OSError:
+        shutil.copy2(archival, temporary)
+    os.replace(temporary, current)
 
 
 def _strip_module_prefix(state_dict: dict[str, Any]) -> dict[str, Any]:
@@ -255,7 +410,8 @@ def save_final_artifacts(logdir: str, model, optimizer, scheduler, scaler, globa
     torch.save(raw_model.state_dict(), root / "final_model.pt")
     # Plain backbone keys (swinViT.*, encoder1.*, ...) match downstream
     # SwinUNETR loaders directly, without requiring a backbone. prefix strip.
-    torch.save(
-        {"global_step": int(global_step), "state_dict": raw_model.backbone.state_dict()},
-        root / "encoder_final.pt",
-    )
+    if not getattr(args, "disable_encoder_export", False):
+        torch.save(
+            {"global_step": int(global_step), "state_dict": raw_model.backbone.state_dict()},
+            root / "encoder_final.pt",
+        )

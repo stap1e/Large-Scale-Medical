@@ -26,8 +26,6 @@ class VoCoAugmentation():
         num_crops = 3
         max_roi = 192
 
-        crops_trans = get_crop_transform(num_crops=num_crops, aug=self.aug)
-
         vanilla_trans, labels = get_vanilla_transform(num=self.args.sw_batch_size, num_crops=num_crops,
                                                       max_roi=max_roi, aug=self.aug)
 
@@ -36,10 +34,18 @@ class VoCoAugmentation():
             img = trans(x_in)
             imgs.append(img)
 
+        # OCL consumes only ``imgs`` and historically discarded all nine VoCo
+        # base crops after they had been transformed, collated, sent through
+        # worker IPC, and pinned.  That can drain the prefetch queue on CT-RATE.
+        # Keep the original triple return contract while omitting the unused
+        # work.  VoCo and the explicit compatibility switch retain old behavior.
         crops = []
-        for trans in crops_trans:
-            crop = trans(x_in)
-            crops.append(crop)
+        is_ocl = getattr(self.args, "pretraining_method", "voco").lower() == "ocl"
+        if not (is_ocl and getattr(self.args, "skip_unused_ocl_crops", True)):
+            crops_trans = get_crop_transform(num_crops=num_crops, aug=self.aug)
+            for trans in crops_trans:
+                crop = trans(x_in)
+                crops.append(crop)
 
         return imgs, labels, crops
 

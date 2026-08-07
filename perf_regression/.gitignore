@@ -1,0 +1,14 @@
+step_timing*.csv
+effective_config.json
+throughput.json
+view_merge_equivalence.json
+*_summary.json
+traces/
+runs/
+dataloader_sweep/
+launch_ablation/
+cache_write_ablation/
+system_*/
+nsys/
+*.nsys-rep
+*.sqlite

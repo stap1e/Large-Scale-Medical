@@ -11,6 +11,7 @@ import json
 import pickle
 import random
 import re
+from copy import deepcopy
 from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -19,12 +20,83 @@ import numpy as np
 import torch
 from monai.data import DataLoader, Dataset, PersistentDataset, load_decathlon_datalist
 from monai.transforms import Compose
+from torch.utils.data import Sampler
 from torch.utils.data.distributed import DistributedSampler
 
 from utils.data_trans import get_chest_trans
+from utils.perf_diagnostics import InstrumentedDataset
 
 
 PATIENT_DIR_RE = re.compile(r"^train_(\d+)$")
+
+
+class ReadOnlyPersistentDataset(PersistentDataset):
+    """PersistentDataset variant that preserves cache hits but never writes misses."""
+
+    def _cachecheck(self, item_transformed):
+        hashfile = None
+        if self.cache_dir is not None:
+            digest = self.hash_func(item_transformed)
+            if isinstance(digest, bytes):
+                digest = digest.decode("utf-8")
+            hashfile = Path(self.cache_dir) / f"{digest}{self.transform_hash}.pt"
+        if hashfile is not None and hashfile.is_file():
+            return torch.load(hashfile)
+        return self._pre_transform(deepcopy(item_transformed))
+
+
+class ContinuousBatchSampler(Sampler[list[int]]):
+    """Yield the same per-epoch shuffled batches without ending the loader iterator.
+
+    A short CT-RATE subset otherwise tears down and re-primes the prefetch queue
+    every few dozen steps.  Logical epoch order and DistributedSampler-style
+    rank partitioning are retained; only the iterator boundary is removed.
+    """
+
+    def __init__(
+        self,
+        *,
+        dataset_size: int,
+        batch_size: int,
+        rank: int,
+        world_size: int,
+        seed: int,
+        max_batches: int,
+    ):
+        self.dataset_size = int(dataset_size)
+        self.batch_size = int(batch_size)
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.seed = int(seed)
+        self.max_batches = int(max_batches)
+        self.samples_per_rank = self.dataset_size // self.world_size
+        self.batches_per_epoch = self.samples_per_rank // self.batch_size
+        if self.batches_per_epoch <= 0:
+            raise ValueError(
+                "CT-RATE subset is too small for one full OCL batch per rank: "
+                f"dataset={dataset_size}, world_size={world_size}, batch_size={batch_size}"
+            )
+
+    def __len__(self) -> int:
+        return self.max_batches
+
+    def __iter__(self):
+        emitted = 0
+        epoch = 0
+        total_size = self.samples_per_rank * self.world_size
+        while emitted < self.max_batches:
+            generator = torch.Generator()
+            generator.manual_seed(self.seed + epoch)
+            indices = torch.randperm(self.dataset_size, generator=generator).tolist()
+            indices = indices[:total_size]
+            rank_indices = indices[self.rank:total_size:self.world_size]
+            usable = self.batches_per_epoch * self.batch_size
+            for offset in range(0, usable, self.batch_size):
+                if emitted >= self.max_batches:
+                    return
+                yield rank_indices[offset : offset + self.batch_size]
+                emitted += 1
+            epoch += 1
 
 
 def _read_manifest(args) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -71,13 +143,14 @@ def _read_manifest(args) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         patient_ids.add(patient_id)
         resolved_paths.append(data_root.joinpath(*relative.parts))
 
-    missing = [path for path in resolved_paths if not path.is_file()]
-    if missing:
-        preview = "\n  ".join(str(path) for path in missing[:10])
-        more = f"\n  ... and {len(missing) - 10} more" if len(missing) > 10 else ""
-        raise FileNotFoundError(
-            f"{len(missing)} of {len(resolved_paths)} CT-RATE paths do not exist:\n  {preview}{more}"
-        )
+    if not getattr(args, "disable_data_integrity_check", False):
+        missing = [path for path in resolved_paths if not path.is_file()]
+        if missing:
+            preview = "\n  ".join(str(path) for path in missing[:10])
+            more = f"\n  ... and {len(missing) - 10} more" if len(missing) > 10 else ""
+            raise FileNotFoundError(
+                f"{len(missing)} of {len(resolved_paths)} CT-RATE paths do not exist:\n  {preview}{more}"
+            )
 
     datalist = load_decathlon_datalist(
         str(datalist_json),
@@ -99,7 +172,12 @@ def get_dataset(args, datalist: list[dict[str, Any]] | None = None):
     if args.cache:
         cache_dir = Path(args.cache_dir).expanduser()
         cache_dir.mkdir(parents=True, exist_ok=True)
-        return PersistentDataset(
+        dataset_type = (
+            ReadOnlyPersistentDataset
+            if getattr(args, "disable_cache_write", False)
+            else PersistentDataset
+        )
+        return dataset_type(
             data=datalist,
             transform=transform,
             cache_dir=str(cache_dir),
@@ -112,30 +190,80 @@ def _make_loader(args, dataset) -> DataLoader:
     is_ocl = getattr(args, "pretraining_method", "voco").lower() == "ocl"
     # OCL performs an in-batch contrastive loss.  Full per-rank batches prevent
     # rank-dependent shapes, especially on the final batch of a DDP epoch.
-    drop_last = is_ocl
-    sampler = None
-    if args.distributed:
-        sampler = DistributedSampler(
-            dataset,
-            num_replicas=args.world_size,
-            rank=args.rank,
-            shuffle=True,
-            seed=getattr(args, "seed", 2026),
-            drop_last=drop_last,
-        )
+    drop_last = bool(
+        is_ocl and getattr(args, "ocl_drop_last", True)
+    )
+    diagnostic_event = None
+    if getattr(args, "diagnose_gpu_gaps", False) and not getattr(
+        args, "data_check_only", False
+    ):
+        context_name = getattr(args, "multiprocessing_context", None)
+        process_context = torch.multiprocessing.get_context(context_name)
+        diagnostic_event = process_context.Event()
+        diagnostic_event.set()
+        dataset = InstrumentedDataset(dataset, diagnostic_event)
 
     workers = int(args.workers)
-    return DataLoader(
+    loader_kwargs = {
+        "num_workers": workers,
+        "pin_memory": bool(
+            getattr(args, "pin_memory", True) and torch.cuda.is_available()
+        ),
+        "persistent_workers": bool(
+            workers > 0 and getattr(args, "persistent_workers", True)
+        ),
+    }
+    if workers > 0:
+        loader_kwargs["prefetch_factor"] = int(getattr(args, "prefetch_factor", 2))
+        context = getattr(args, "multiprocessing_context", None)
+        if context is not None:
+            loader_kwargs["multiprocessing_context"] = context
+
+    use_continuous = bool(
+        is_ocl and getattr(args, "continuous_dataloader", True)
+    )
+    if use_continuous:
+        continuous_sampler = ContinuousBatchSampler(
+            dataset_size=len(dataset),
+            batch_size=int(args.batch_size),
+            rank=int(args.rank),
+            world_size=int(args.world_size),
+            seed=int(getattr(args, "seed", 2026)),
+            # Leave headroom for rare AMP-overflow retries in strict mode.
+            max_batches=max(int(args.num_steps) + 1024, int(args.num_steps) * 2),
+        )
+        loader = DataLoader(
+            dataset,
+            batch_sampler=continuous_sampler,
+            **loader_kwargs,
+        )
+        loader.voco_continuous = True
+        loader.voco_batches_per_epoch = continuous_sampler.batches_per_epoch
+        loader.voco_diagnostic_event = diagnostic_event
+        return loader
+
+    # Use the same private seed+epoch ordering as ContinuousBatchSampler even
+    # on one rank. RandomSampler would consume the global generator differently
+    # when DataLoader creates worker seeds and would confound A/B comparisons.
+    sampler = DistributedSampler(
+        dataset,
+        num_replicas=args.world_size,
+        rank=args.rank,
+        shuffle=True,
+        seed=getattr(args, "seed", 2026),
+        drop_last=drop_last,
+    )
+
+    loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=sampler is None,
-        num_workers=workers,
+        shuffle=False,
         sampler=sampler,
-        pin_memory=torch.cuda.is_available(),
         drop_last=drop_last,
-        # PyTorch rejects persistent_workers=True when num_workers == 0.
-        persistent_workers=workers > 0,
+        **loader_kwargs,
     )
+    loader.voco_diagnostic_event = diagnostic_event
+    return loader
 
 
 def get_loader(args) -> DataLoader:
@@ -191,7 +319,10 @@ def run_data_check(args) -> None:
     print("=== CT-RATE subset data check ===")
     print(f"JSON: {Path(args.datalist_json).expanduser()}")
     print(f"JSON entries: {len(datalist)} (numTraining={manifest['numTraining']})")
-    print(f"All {len(datalist)} paths exist under: {Path(args.data_root).expanduser()}")
+    if getattr(args, "disable_data_integrity_check", False):
+        print("All-path existence scan: disabled")
+    else:
+        print(f"All {len(datalist)} paths exist under: {Path(args.data_root).expanduser()}")
     print(f"Cache: {Path(args.cache_dir).expanduser() if args.cache else 'disabled'}")
 
     try:
@@ -219,33 +350,44 @@ def run_data_check(args) -> None:
     if not _finite_and_stats(transformed, "sample"):
         raise RuntimeError("NaN or Inf found in transformed sample")
 
+    print("Creating DataLoader ...", flush=True)
     loader = _make_loader(args, dataset)
+    print(f"DataLoader created; batches={len(loader)}. Fetching first batch ...", flush=True)
     if not len(loader):
         raise RuntimeError(
             f"CT-RATE loader has zero batches (dataset={len(dataset)}, batch_size={args.batch_size}, "
             f"drop_last={loader.drop_last})"
         )
     batch = next(iter(loader))
+    print("First batch fetched.", flush=True)
     print("Collated batch tensors:")
     if not _finite_and_stats(batch, "batch"):
         raise RuntimeError("NaN or Inf found in collated batch")
 
     random_views, labels, base_views = batch
     random_crops = _concat_views(random_views)
-    base_crops = _concat_views(base_views)
     expected_random = labels.shape[0] * int(args.sw_batch_size)
-    expected_bases = labels.shape[0] * 9
     if tuple(random_crops.shape[1:]) != (1, 64, 64, 64) or random_crops.shape[0] != expected_random:
         raise RuntimeError(f"unexpected random-crop training shape: {tuple(random_crops.shape)}")
-    if tuple(base_crops.shape[1:]) != (1, 64, 64, 64) or base_crops.shape[0] != expected_bases:
-        raise RuntimeError(f"unexpected base-crop training shape: {tuple(base_crops.shape)}")
     if tuple(labels.shape[1:]) != (int(args.sw_batch_size), 9):
         raise RuntimeError(f"unexpected VoCo label shape: {tuple(labels.shape)}")
 
     print("Training-loop batch contract:")
     print(f"  random crops: {tuple(random_crops.shape)}")
-    print(f"  base crops:   {tuple(base_crops.shape)}")
     print(f"  labels:       {tuple(labels.shape)}")
     if getattr(args, "pretraining_method", "voco").lower() == "ocl":
-        print("  OCL consumes random crops; its existing model code creates the two masked views.")
+        if getattr(args, "skip_unused_ocl_crops", True):
+            if base_views:
+                raise RuntimeError("OCL base crops were expected to be omitted")
+            print("  base crops:   omitted (unused by OCL)")
+        else:
+            base_crops = _concat_views(base_views)
+            print(f"  base crops:   {tuple(base_crops.shape)} (compatibility mode)")
+        print("  OCL consumes random crops; its model code creates the two masked views.")
+    else:
+        base_crops = _concat_views(base_views)
+        expected_bases = labels.shape[0] * 9
+        if tuple(base_crops.shape[1:]) != (1, 64, 64, 64) or base_crops.shape[0] != expected_bases:
+            raise RuntimeError(f"unexpected base-crop training shape: {tuple(base_crops.shape)}")
+        print(f"  base crops:   {tuple(base_crops.shape)}")
     print("Data check passed.")

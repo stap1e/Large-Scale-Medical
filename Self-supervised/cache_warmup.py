@@ -22,9 +22,16 @@ import argparse
 from time import time
 
 import torch
+from torch.utils.data import DataLoader
 
 from utils.data_utils_ctrate_subset import _read_manifest, get_dataset
 from utils.pretrain_common import add_data_arguments
+
+
+def _discard_collate(_batch):
+    """Warmup needs cache side effects, not transformed crop tensors in the parent."""
+
+    return None
 
 
 def _patch_torch_load_weights_only() -> None:
@@ -57,7 +64,7 @@ _patch_torch_load_weights_only()
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Warm up the CT-RATE PersistentDataset cache")
     add_data_arguments(parser)
-    parser.add_argument("--workers", default=8, type=int, help="(unused; kept for CLI compatibility)")
+    parser.add_argument("--workers", default=8, type=int, help="parallel cache-build workers")
     parser.add_argument("--roi_x", default=64, type=int)
     parser.add_argument("--roi_y", default=64, type=int)
     parser.add_argument("--roi_z", default=64, type=int)
@@ -68,6 +75,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     args.cache = True
+    args.disable_cache_write = False
+    args.pretraining_method = "ocl"
+    args.skip_unused_ocl_crops = True
+    args.diagnose_gpu_gaps = False
 
     manifest, datalist = _read_manifest(args)
     print(f"datalist: {args.datalist_json}")
@@ -77,8 +88,15 @@ def main() -> None:
     dataset = get_dataset(args, datalist)
     total = len(dataset)
     start = time()
-    for index in range(total):
-        dataset[index]
+    loader = DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=max(0, int(args.workers)),
+        collate_fn=_discard_collate,
+        persistent_workers=False,
+    )
+    for index, _ in enumerate(loader):
         if (index + 1) % 50 == 0 or index + 1 == total:
             elapsed = time() - start
             print(f"  {index + 1}/{total}  ({elapsed:.1f}s, {(index + 1) / elapsed:.2f} it/s)")
