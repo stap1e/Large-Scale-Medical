@@ -59,7 +59,7 @@ def train_epoch(model, loader, optimizer, scheduler, scaler, epoch, loss_func, a
         if scheduler is not None:
             scheduler.step()
 
-        length = len(loader) // 4
+        length = max(len(loader) // 4, 1)
         if args.rank == 0 and (idx + 1) % length == 0:
             print(
                 "Epoch {}/{} {}/{}".format(epoch, args.max_epochs, idx, len(loader)),

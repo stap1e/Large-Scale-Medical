@@ -35,7 +35,9 @@ from monai.utils import ensure_tuple_rep
 from utils.utils import *
 from models import get_model
 
-os.environ['CUDA_VISIBLE_DEVICES'] = "6"
+torch.load = partial(torch.load, weights_only=False)
+
+os.environ['CUDA_VISIBLE_DEVICES'] = "0"
 os.environ['MASTER_ADDR'] = 'localhost'
 os.environ['MASTER_PORT'] = '28890'
 
