@@ -12,7 +12,7 @@ mkdir -p $logdir
 
 python main.py \
     --name $name \
-    --batch_size 2 \
+    --batch_size 6 \
     --pretrained_root $pretrained_root \
     --feature_size $feature_size \
     --data_dir $data_dir \
